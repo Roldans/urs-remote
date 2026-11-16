@@ -96,14 +96,20 @@ def ws_connect(web_port, proc=None, timeout=10.0):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    headers = {}
+    token = _TEST_SESSIONS.get(web_port)
+    if token:
+        headers["Cookie"] = f"wfweb_session={token}"
     try:
-        return connect(f"wss://127.0.0.1:{web_port}", ssl=ctx, open_timeout=timeout)
+        return connect(f"wss://127.0.0.1:{web_port}", ssl=ctx, open_timeout=timeout,
+                       additional_headers=headers or None)
     except TimeoutError as e:
         tail = wfweb_output_tail(proc) if proc is not None else "(no server handle)"
         pytest.fail(f"WSS upgrade on port {web_port} unanswered for {timeout} s: {e}\n"
                     f"--- wfweb output (tail) ---\n{tail}")
     except (ssl.SSLError, OSError):
-        return connect(f"ws://127.0.0.1:{web_port + 1}", open_timeout=timeout)
+        return connect(f"ws://127.0.0.1:{web_port + 1}", open_timeout=timeout,
+                       additional_headers=headers or None)
 
 
 def _dump_and_fail(proc, event_loop, loop_thread, message, url):
@@ -214,6 +220,102 @@ def mock_radio_7300(event_loop):
     _run_on_loop(event_loop, server.stop())
 
 
+
+# ---------------------------------------------------------------------------
+# Authenticated access to test instances
+# ---------------------------------------------------------------------------
+# wfweb requires a login for the radio REST API and the WebSocket control
+# channel. Every test instance boots with a fresh database seeded with the
+# initial admin EA7URS/EA7URS (README), which must replace its password
+# before radio access. Tests keep calling plain requests.get(...) etc.; the
+# shim below attaches the instance's session cookie to requests aimed at a
+# test server, so test bodies stay unchanged and still go through the real
+# login flow. No authentication is disabled anywhere.
+#
+# Scope and isolation of the shim:
+# - The cookie is attached ONLY to URLs on host 127.0.0.1/localhost AND a
+#   registered test port (web_port or its REST port web_port + 1). Any other
+#   host or port goes out untouched; no cookie ever leaves this registry.
+# - The registry lives in this pytest process and dies with it; nothing is
+#   written outside the per-instance HOME directories (/tmp/wfweb-test*).
+# - The shim only wraps the module-level convenience API (requests.get and
+#   friends). An explicit requests.Session() does NOT pass through it, which
+#   is the sanctioned way to get an anonymous or differently-roled client:
+#   see tests/test_auth.py for anonymous (401), normal-user (403 on admin)
+#   and admin (allowed) coverage. The legacy tests exercise the admin role,
+#   matching their pre-authentication behaviour of full radio access.
+
+_TEST_SESSIONS = {}  # web_port -> wfweb_session token
+_TEST_ADMIN_PASSWORD = "wfweb-test-pass"
+_requests_shim_installed = False
+
+
+def _install_requests_shim():
+    """Patch requests.api.request once so calls to a test server port carry
+    its wfweb_session cookie."""
+    global _requests_shim_installed
+    if _requests_shim_installed:
+        return
+    _requests_shim_installed = True
+    original = requests.api.request
+
+    def authed_request(method, url, **kwargs):
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+        except ValueError:
+            host, port = None, None
+        if host in ("127.0.0.1", "localhost", "::1") and port is not None:
+            for web_port, token in _TEST_SESSIONS.items():
+                # REST lives on web_port + 1; both ports share the session.
+                if port in (web_port, web_port + 1):
+                    headers = dict(kwargs.get("headers") or {})
+                    headers.setdefault("Cookie", f"wfweb_session={token}")
+                    kwargs["headers"] = headers
+                    break
+        return original(method, url, **kwargs)
+
+    requests.api.request = authed_request
+
+
+def _wait_for_listener(url, timeout=15.0):
+    """True once the REST listener answers at all (a 401 already means up)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            requests.get(url, timeout=2)
+            return True
+        except requests.ConnectionError:
+            time.sleep(0.3)
+    return False
+
+
+def _login_test_instance(rest_base, web_port):
+    """Log the seeded admin in on one test instance and register its session.
+
+    Handles a fresh database (initial password, forced change) and a reused
+    one from an earlier run (password already changed).
+    """
+    s = requests.Session()
+    r = s.post(f"{rest_base}/api/v1/auth/login",
+               json={"userId": "EA7URS", "password": "EA7URS"}, timeout=5)
+    if r.status_code == 401:  # database reused: password already changed
+        r = s.post(f"{rest_base}/api/v1/auth/login",
+                   json={"userId": "EA7URS", "password": _TEST_ADMIN_PASSWORD}, timeout=5)
+    r.raise_for_status()
+    if r.json().get("mustChangePassword"):
+        r = s.post(f"{rest_base}/api/v1/auth/password",
+                   json={"currentPassword": "EA7URS",
+                         "newPassword": _TEST_ADMIN_PASSWORD}, timeout=5)
+        r.raise_for_status()
+    token = s.cookies.get("wfweb_session")
+    if not token:
+        pytest.fail(f"login on {rest_base} returned no wfweb_session cookie")
+    _TEST_SESSIONS[web_port] = token
+    _install_requests_shim()
+
 # ---------------------------------------------------------------------------
 # wfweb subprocess fixture
 # ---------------------------------------------------------------------------
@@ -275,6 +377,11 @@ def _launch_wfweb(mock, event_loop, rigctld_port, civ, home):
 
     rest_base = f"http://127.0.0.1:{rest_port}"
     info_url = f"{rest_base}/api/v1/radio/info"
+
+    if not _wait_for_listener(info_url):
+        _dump_and_fail(proc, event_loop, loop_thread,
+                       "wfweb REST listener did not come up", info_url)
+    _login_test_instance(rest_base, web_port)
 
     if not _wait_for_connected(info_url, timeout=15.0):
         _dump_and_fail(proc, event_loop, loop_thread,
@@ -390,6 +497,12 @@ def usb_wfweb_instance(serial_mock):
 
     rest_base = f"http://127.0.0.1:{rest_port}"
     info_url = f"{rest_base}/api/v1/radio/info"
+
+    if not _wait_for_listener(info_url):
+        proc.terminate()
+        proc.kill()
+        pytest.fail(f"wfweb (USB) REST listener did not come up. PTY: {serial_mock.port_path}")
+    _login_test_instance(rest_base, web_port)
 
     if not _wait_for_connected(info_url, timeout=15.0):
         proc.terminate()
