@@ -6,13 +6,13 @@ name: Deploy standalone to GitHub Pages
 # the bundle to GitHub Pages.
 #
 # One-time repo setup: Settings → Pages → Build and deployment → Source
-# = "GitHub Actions". With that flipped on, every push to master runs
+# = "GitHub Actions". With that flipped on, every push to main runs
 # this workflow. Manual dispatch from any branch lets you preview the
 # bundle without merging.
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
