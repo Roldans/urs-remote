@@ -54,6 +54,9 @@ def policy(rest_url):
     _set_policy(rest_base, [b for b in all_bands if b != BAND_20M])
     yield
     _set_policy(rest_base, all_bands)
+    # The recoveries in this module park the dial on 14.100 MHz; put it back
+    # where the other test files expect it (the mock's 14.074 MHz default).
+    requests.put(f"{rest_base}/radio/frequency", json={"hz": 14_074_000}, timeout=5)
 
 
 def test_policy_roundtrip(rest_url, policy):
