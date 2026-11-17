@@ -323,13 +323,16 @@ def _login_test_instance(rest_base, web_port):
 
 @pytest.fixture(scope="session")
 def rigctld_port():
-    """TCP port of the rigctld server started with wfweb_instance (localhost only)."""
+    """Port requested via --rigctld-port for wfweb_instance. With the
+    authenticated web interface wfweb refuses to open it (#3); the rigctld
+    tests assert that nothing ever listens here."""
     return _find_free_port()
 
 
 @pytest.fixture(scope="session")
 def rigctld_7300_port():
-    """TCP port of the rigctld server started with wfweb_7300_instance."""
+    """Port requested via --rigctld-port for wfweb_7300_instance; expected
+    to stay closed while auth is enabled (see rigctld_port)."""
     return _find_free_port()
 
 
@@ -350,6 +353,8 @@ def _launch_wfweb(mock, event_loop, rigctld_port, civ, home):
         "--lan-user", "testuser",
         "--lan-pass", "testpass",
         "--civ", civ,
+        # Deliberately requested even though auth disables rigctld: the
+        # regression tests prove the port stays closed in this configuration.
         "--rigctld-port", str(rigctld_port),
     ]
 
