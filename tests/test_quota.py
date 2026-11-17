@@ -86,7 +86,18 @@ def _ws_as(session, web_port):
                    additional_headers={"Cookie": f"wfweb_session={token}"})
 
 
-def test_ptt_is_released_when_the_daily_quota_runs_out(rest_url, wfweb_instance, poll):
+def _wait_mock_ptt(mock_radio, state, timeout=10.0):
+    """The server cache answers before the CI-V write reaches the radio, so
+    the mock state needs its own poll, like the REST one."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if mock_radio.ptt is state:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"mock radio PTT did not reach {state} within {timeout} s")
+
+
+def test_ptt_is_released_when_the_daily_quota_runs_out(rest_url, wfweb_instance, mock_radio, poll):
     api = _api(rest_url)
     _proc, web_port = wfweb_instance
     s = _quota_session(api)
@@ -96,10 +107,12 @@ def test_ptt_is_released_when_the_daily_quota_runs_out(rest_url, wfweb_instance,
     assert usage["allowed"] is True
     assert usage["profileName"] == PROFILE_NAME
 
+    mark = len(mock_radio.civ_log)
     ws = _ws_as(s, web_port)
     try:
         ws.send(json.dumps({"cmd": "setPTT", "value": True}))
         poll("ptt", lambda d: d.get("transmitting") is True, timeout=5.0)
+        _wait_mock_ptt(mock_radio, True)
 
         # One minute of allowance: the server checks every second, so the
         # denial must land well inside 90 s.
@@ -119,7 +132,14 @@ def test_ptt_is_released_when_the_daily_quota_runs_out(rest_url, wfweb_instance,
         except Exception:
             pass
 
+    # The notice and the REST cache are the server's word; the transmission
+    # is only over when the radio got keyed off. The mock tracks the last
+    # 1C 00 write, and the command itself must be on the wire.
     poll("ptt", lambda d: d.get("transmitting") is False, timeout=5.0)
+    _wait_mock_ptt(mock_radio, False)
+    ptt_off_frames = [f for f in mock_radio.civ_log[mark:]
+                      if bytes(f[4:7]) == b"\x1c\x00\x00"]
+    assert ptt_off_frames, "no PTT-off command (1C 00 00) reached the radio"
 
     r = s.get(f"{api}/reservations", timeout=5)
     assert r.json()["usage"]["allowed"] is False
