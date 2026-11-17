@@ -135,6 +135,11 @@ class CivRadioBase:
     # State setters (for test setup)
     # ------------------------------------------------------------------
 
+    @property
+    def frequency(self) -> int:
+        """Current dial frequency in Hz: the last value written over CI-V."""
+        return self._frequency
+
     def set_frequency(self, hz: int) -> None:
         self._frequency = hz
 
